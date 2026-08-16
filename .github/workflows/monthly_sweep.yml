@@ -1,0 +1,101 @@
+name: Monthly Sweep
+
+on:
+  repository_dispatch:
+    types: [sync-comments-monthly]
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "遡る日数"
+        required: false
+        default: "31"
+      window_end:
+        description: "固定スキャン窓の終了epoch秒（初回再開用）"
+        required: false
+        default: ""
+      resume_offset:
+        description: "初回状態作成時の処理済み件数"
+        required: false
+        default: "0"
+      restart:
+        description: "既存カーソルを破棄して新規開始"
+        type: boolean
+        required: false
+        default: false
+      dry_run:
+        description: "対象件数と概算コストだけ出す"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: sync-comments-monthly
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check JST monthly schedule
+        id: jst_gate
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "repository_dispatch" && "$(TZ=Asia/Tokyo date +%d)" != "01" ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Not the first day of the month in JST; skipping monthly sweep."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.jst_gate.outputs.run == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.jst_gate.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        if: steps.jst_gate.outputs.run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Verify secret
+        if: github.event_name == 'repository_dispatch' && steps.jst_gate.outputs.run == 'true'
+        env:
+          RECEIVED_CRONJOB_SECRET: ${{ github.event.client_payload.secret }}
+          CRONJOB_SECRET: ${{ secrets.CRONJOB_SECRET }}
+        run: |
+          if [[ "$RECEIVED_CRONJOB_SECRET" != "$CRONJOB_SECRET" ]]; then
+            echo "Invalid secret"
+            exit 1
+          fi
+
+      - name: Run monthly sweep
+        if: steps.jst_gate.outputs.run == 'true'
+        env:
+          API_KEY_FOR_MONTHLY_SWEEP: ${{ secrets.API_KEY_FOR_MONTHLY_SWEEP }}
+          VIDEO_ID:                  ${{ vars.VIDEO_ID }}
+          TURSO_URL:                 ${{ secrets.TURSO_URL }}
+          TURSO_AUTH_TOKEN:          ${{ secrets.TURSO_AUTH_TOKEN }}
+          SWEEP_DAYS:                ${{ github.event.inputs.days || '31' }}
+          SWEEP_WINDOW_END:          ${{ github.event.inputs.window_end || '' }}
+          SWEEP_RESUME_OFFSET:       ${{ github.event.inputs.resume_offset || '0' }}
+          SWEEP_RESTART:             ${{ github.event.inputs.restart || 'false' }}
+          SWEEP_DRY_RUN:             ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          ARGS="--days $SWEEP_DAYS"
+          if [[ -n "$SWEEP_WINDOW_END" ]]; then
+            ARGS="$ARGS --window-end $SWEEP_WINDOW_END"
+          fi
+          if [[ "$SWEEP_RESUME_OFFSET" != "0" ]]; then
+            ARGS="$ARGS --resume-offset $SWEEP_RESUME_OFFSET"
+          fi
+          if [[ "$SWEEP_RESTART" == "true" ]]; then
+            ARGS="$ARGS --restart"
+          fi
+          if [[ "$SWEEP_DRY_RUN" == "true" ]]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python monthly_sweep.py $ARGS
