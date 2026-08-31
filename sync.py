@@ -164,14 +164,34 @@ def is_rate_limit_error(e: HttpError) -> bool:
 MAX_RATE_LIMIT_RETRIES = 5
 RATE_LIMIT_BACKOFF_BASE_SEC = 2  # 2, 4, 8, 16, 32 秒と指数バックオフ
 
+# 2026-08-31追加: commentThreads.list が稀に「400 processingFailure」を返す既知の
+# YouTube側一過性エラー(リクエスト自体は正常 — 同じパラメータでも直後のrunは大半成功する。
+# 2026-08-16〜08-30の実績でSync Comments 11回・Hot Recheck 3回発生を確認)。以前はこれを
+# レート制限・日次クォータ以外のHttpErrorとして即座に呼び出し元へ再送出しており、
+# main()の最初に呼ばれるsync_new_comments()でこれが起きると、その回のksk検出・追跡・
+# 時間バケット更新まで全部道連れでクラッシュしていた。5xx系もGoogle公式に一過性エラー
+# として扱われる分類なので同じ枠に含める。キー固有の問題ではないため、レート制限と違い
+# リトライを使い切ってもキーローテーションはしない(ローテーションしても解消しない)。
+MAX_TRANSIENT_RETRIES = 3
+TRANSIENT_BACKOFF_BASE_SEC = 2  # 2, 4, 8 秒
+
+
+def is_transient_server_error(e: HttpError) -> bool:
+    """Google側の一過性エラー。待って同じキーで再試行すれば大抵解消する。"""
+    err = str(e).lower()
+    return e.resp.status >= 500 or "processingfailure" in err
+
 
 def _handle_api_error(e: HttpError, youtube, rate_limit_retries: int):
     """YouTube API呼び出し失敗時の共通ハンドリング。4箇所のリトライループで共用する。
 
     レート制限(is_rate_limit_error)は MAX_RATE_LIMIT_RETRIES 回まで同じキーの
     ままバックオフして再試行し、それでも解消しなければ日次クォータ枯渇と同じく
-    rotate_key() で次のキーへ切り替える。それ以外の HttpError はここでは
-    処理せず、呼び出し側に再送出させる。
+    rotate_key() で次のキーへ切り替える。一過性サーバーエラー
+    (is_transient_server_error)も同じく同じキーでバックオフ再試行するが、
+    MAX_TRANSIENT_RETRIES回使い切った場合はキーローテーションせずそのまま
+    呼び出し元へ再送出する。それ以外の HttpError はここでは処理せず、
+    呼び出し側に再送出させる。
 
     戻り値: (次に使う youtube クライアント, 更新後の rate_limit_retries,
              呼び出し元で raise すべきか, 全キー枯渇で諦めるべきか)
@@ -191,6 +211,21 @@ def _handle_api_error(e: HttpError, youtube, rate_limit_retries: int):
             f"キーを切り替える",
             flush=True,
         )
+    elif is_transient_server_error(e):
+        if rate_limit_retries < MAX_TRANSIENT_RETRIES:
+            wait = TRANSIENT_BACKOFF_BASE_SEC * (2 ** rate_limit_retries)
+            print(
+                f"  一過性サーバーエラー({e.resp.status})、{wait}秒待って同じキーで"
+                f"リトライ({rate_limit_retries + 1}/{MAX_TRANSIENT_RETRIES}): {e}",
+                flush=True,
+            )
+            time.sleep(wait)
+            return youtube, rate_limit_retries + 1, False, False
+        print(
+            f"  一過性サーバーエラーが{MAX_TRANSIENT_RETRIES}回連続で解消しないため諦める: {e}",
+            flush=True,
+        )
+        return youtube, rate_limit_retries, True, False
     elif not is_daily_quota_error(e):
         return youtube, rate_limit_retries, True, False
 
