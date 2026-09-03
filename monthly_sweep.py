@@ -96,23 +96,6 @@ def _snapshot_thread_rows(client: TursoClient, thread_ids: list[str]) -> dict[st
     return snapshot
 
 
-def _changed_rows(before: dict[str, dict], after: dict[str, dict]) -> list[dict]:
-    """Return both sides of every insert/delete or aggregate-relevant edit."""
-    changed: list[dict] = []
-    for comment_id in set(before) | set(after):
-        old = before.get(comment_id)
-        new = after.get(comment_id)
-        fields = (
-            "parent_id", "author_channel_id", "handle", "text", "published_at", "is_deleted",
-        )
-        if old is None or new is None or any(old.get(field) != new.get(field) for field in fields):
-            if old is not None:
-                changed.append(old)
-            if new is not None:
-                changed.append(new)
-    return changed
-
-
 def _repair_work(rows: list[dict]) -> dict[str, set[str]]:
     work: dict[str, set[str]] = defaultdict(set)
     for row in rows:
@@ -138,10 +121,23 @@ def _repair_work(rows: list[dict]) -> dict[str, set[str]]:
 
 
 def _persist_chunk_repairs(
-    client: TursoClient, thread_ids: list[str], before: dict[str, dict],
+    client: TursoClient, touched_ids: list[str],
 ) -> tuple[int, int]:
-    after = _snapshot_thread_rows(client, thread_ids)
-    changed = _changed_rows(before, after)
+    """touched_ids(消滅/食い違いと判定されたスレッドID)に絞って現在の行を読み、
+    そのまま repair_queue へ登録する。
+
+    2026-09-04: 以前はチャンク全件(最大5000スレッド+その返信全部)を処理の前後で
+    2回スナップショットして差分を取っていたが、実際に行が変化しうるのは
+    touched_ids(実測でチャンクの約1割)に限られる。_recheck_threads() が
+    Pass1の時点で判明済みのdead_ids/mismatchedをそのままtouched_idsへ詰めて
+    返す(追加のTurso読み取り無し)ので、このID集合だけを1回読めば済み、
+    以前の"before"スナップショットや差分計算(_changed_rows)自体が不要になる
+    (このIDに紐づく行はこのチャンクの処理で変化した/変化し得るものだけなので、
+    読めた行=変化した行とみなしてよい)。
+    """
+    if not touched_ids:
+        return 0, 0
+    changed = list(_snapshot_thread_rows(client, touched_ids).values())
     work = _repair_work(changed)
     queued = repair_queue.enqueue(client, work) if work else 0
     return len(changed), queued
@@ -399,26 +395,29 @@ def main() -> None:
             break
 
         chunk = threads[i:i + CHUNK_THREADS]
-        thread_ids = [row["comment_id"] for row in chunk]
-        before = _snapshot_thread_rows(client, thread_ids)
         # pass2_cap は指定しない(無制限) — 月次スイープは TIME_BUDGET_SEC +
         # チャンク分割で実行時間を管理しており、Pass2 を人為的に絞ると
         # 「毎月一括で確実に整合性を取る」という役割そのものが弱まるため。
+        #
+        # touched_ids は _recheck_threads が Pass1 完了時点(Pass2の書き込み・
+        # 例外より前)で追記するため、途中で例外が飛んでも「それより前に
+        # 判明した分」は失われない(2026-09-04、_recheck_threadsのdocstring参照)。
+        touched_ids: list[str] = []
         try:
             written, dead, mismatch, aborted, _deferred = _recheck_threads(
-                client, youtube, chunk, "月次スイープ",
+                client, youtube, chunk, "月次スイープ", touched_ids=touched_ids,
             )
         except Exception:
             # Writes may already have succeeded. Persist their repair work
             # before propagating the failure so aggregates cannot drift.
-            changed, queued = _persist_chunk_repairs(client, thread_ids, before)
+            changed, queued = _persist_chunk_repairs(client, touched_ids)
             changed_count += changed
             queued_count += queued
             raise
         total_written += written
         total_dead += dead
         total_mismatch += mismatch
-        changed, queued = _persist_chunk_repairs(client, thread_ids, before)
+        changed, queued = _persist_chunk_repairs(client, touched_ids)
         changed_count += changed
         queued_count += queued
 

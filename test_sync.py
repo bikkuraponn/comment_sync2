@@ -571,6 +571,67 @@ class InlineRepliesOptimizationTests(unittest.TestCase):
         self.assertEqual(mismatch, 1)
         self.assertFalse(aborted)
 
+    def test_recheck_threads_populates_touched_ids_with_dead_and_mismatched(self):
+        """touched_ids に渡したリストへ、消滅スレッドと食い違いスレッドのIDが
+        追記されること(2026-09-04追加。monthly_sweep.py が repair_queue の
+        登録対象をチャンク全件でなくこの集合だけに絞るために使う)。"""
+        threads = [
+            {"comment_id": "alive_ok", "published_at": 100},
+            {"comment_id": "alive_mismatch", "published_at": 200},
+            {"comment_id": "dead", "published_at": 300},
+        ]
+
+        with patch.object(
+            sync, "_pass1_reply_counts",
+            # "dead" は alive_ids に含まれない(=消滅扱い)。"alive_mismatch" は
+            # reply_counts(2) != known_counts(0) で食い違い、2<=INLINE_REPLIES_LIMIT
+            # なのでPass2は呼ばれずinline_repliesだけで完結する。
+            return_value=(
+                object(), {"alive_ok", "alive_mismatch"},
+                {"alive_ok": 1, "alive_mismatch": 2},
+                {"alive_ok": [], "alive_mismatch": []},
+                False, False,
+            ),
+        ), patch.object(
+            sync, "_known_reply_counts",
+            return_value={"alive_ok": 1, "alive_mismatch": 0},
+        ):
+            touched_ids: list[str] = []
+            sync._recheck_threads(
+                self.client, object(), threads, "test", pass2_cap=None,
+                touched_ids=touched_ids,
+            )
+
+        self.assertEqual(set(touched_ids), {"dead", "alive_mismatch"})
+        self.assertNotIn("alive_ok", touched_ids, "変化していないスレッドを含めてはいけない")
+
+    def test_recheck_threads_touched_ids_survive_pass2_exception(self):
+        """touched_ids への追記はPass1直後(Pass2の書き込みより前)に行われるため、
+        Pass2で例外が飛んでもそれ以前に判明した分は呼び出し側に残ること
+        (monthly_sweep.py の例外時repair_queue登録がこの性質に依存している)。"""
+        threads = [{"comment_id": "needs_pass2", "published_at": 100}]
+
+        with patch.object(
+            sync, "_pass1_reply_counts",
+            # totalReplyCount(99) > INLINE_REPLIES_LIMIT なので Pass2 行き
+            return_value=(
+                object(), {"needs_pass2"}, {"needs_pass2": 99}, {"needs_pass2": []},
+                False, False,
+            ),
+        ), patch.object(
+            sync, "_known_reply_counts", return_value={"needs_pass2": 0},
+        ), patch.object(
+            sync, "_resync_thread_replies", side_effect=RuntimeError("boom"),
+        ):
+            touched_ids: list[str] = []
+            with self.assertRaises(RuntimeError):
+                sync._recheck_threads(
+                    self.client, object(), threads, "test", pass2_cap=None,
+                    touched_ids=touched_ids,
+                )
+
+        self.assertEqual(touched_ids, ["needs_pass2"])
+
 
 class KskCommandRegistrationTests(unittest.TestCase):
     """check_ksk_commands() を実DB(sqlite)に対して回す回帰テスト。

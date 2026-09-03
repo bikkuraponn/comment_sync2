@@ -18,22 +18,14 @@ class SqliteTurso:
         self.db.commit()
         return {}
 
+    def batch(self, statements, timeout=30):
+        for stmt in statements:
+            self.db.execute(stmt["sql"], stmt.get("args") or [])
+        self.db.commit()
+        return {}
+
 
 class MonthlySweepRepairTests(unittest.TestCase):
-    def test_changed_rows_detects_insert_and_delete_transition(self):
-        before = {
-            "kept": {"comment_id": "kept", "is_deleted": 0},
-            "gone": {"comment_id": "gone", "is_deleted": 0},
-        }
-        after = {
-            "kept": {"comment_id": "kept", "is_deleted": 0},
-            "gone": {"comment_id": "gone", "is_deleted": 1},
-            "new": {"comment_id": "new", "is_deleted": 0},
-        }
-        changed = monthly_sweep._changed_rows(before, after)
-        self.assertEqual({row["comment_id"] for row in changed}, {"gone", "new"})
-        self.assertEqual(len(changed), 3)
-
     def test_repair_work_routes_exact_date_hour_and_author(self):
         stamp = int(datetime(2026, 7, 10, 12, 34, tzinfo=monthly_sweep.JST).timestamp())
         work = monthly_sweep._repair_work([{
@@ -81,6 +73,71 @@ class SqlShapeTest(unittest.TestCase):
         # comment_id側・parent_id側それぞれにthread_idsぶんのプレースホルダ(2件→4個)
         self.assertEqual(sql.count("?"), len(args))
         self.assertEqual(len(args), 4)
+
+
+class PersistChunkRepairsTests(unittest.TestCase):
+    """2026-09-04: 前後2回のチャンク全件スナップショット+差分計算を廃止し、
+    touched_ids(_recheck_threadsがPass1時点で判明済みの消滅/食い違いスレッド
+    IDを詰めて返す)だけを読む設計に変更した際の回帰テスト。"""
+
+    def setUp(self):
+        self.client = SqliteTurso()
+        self.addCleanup(self.client.db.close)
+        self.client.execute(
+            "CREATE TABLE comments (comment_id TEXT PRIMARY KEY, parent_id TEXT, "
+            "author_channel_id TEXT, handle TEXT, text TEXT, published_at INTEGER, "
+            "is_deleted INTEGER)"
+        )
+        for comment_id, parent_id, author, published_at, is_deleted in (
+            ("thread_a", None, "UC_a", 1000, 1),   # 消滅したスレッド
+            ("reply_a1", "thread_a", "UC_x", 1005, 1),
+            ("thread_b", None, "UC_b", 2000, 0),   # 食い違いで再取得されたスレッド
+            ("reply_b1", "thread_b", "UC_y", 2005, 0),
+            ("thread_c", None, "UC_c", 3000, 0),   # 変化していない(touched対象外)
+        ):
+            self.client.execute(
+                "INSERT INTO comments"
+                "(comment_id,parent_id,author_channel_id,published_at,is_deleted) "
+                "VALUES(?,?,?,?,?)",
+                [comment_id, parent_id, author, published_at, is_deleted],
+            )
+
+    def test_empty_touched_ids_skips_turso_entirely(self):
+        class _ExplodingTurso:
+            def query(self, *a, **k):
+                raise AssertionError("touched_idsが空ならqueryを呼んではいけない")
+
+            def batch(self, *a, **k):
+                raise AssertionError("touched_idsが空ならbatchを呼んではいけない")
+
+            def execute(self, *a, **k):
+                raise AssertionError("touched_idsが空ならexecuteを呼んではいけない")
+
+        changed, queued = monthly_sweep._persist_chunk_repairs(_ExplodingTurso(), [])
+
+        self.assertEqual((changed, queued), (0, 0))
+
+    def test_persist_chunk_repairs_reads_only_touched_ids_and_enqueues_work(self):
+        changed, queued = monthly_sweep._persist_chunk_repairs(
+            self.client, ["thread_a", "thread_b"],
+        )
+
+        # thread_c(未変化)は対象外。thread_a/bとその返信(計4行)だけが対象になる。
+        self.assertEqual(changed, 4)
+        self.assertGreater(queued, 0)
+        rows = self.client.query(
+            "SELECT DISTINCT consumer FROM aggregate_repair_queue ORDER BY consumer"
+        )
+        consumers = {r["consumer"] for r in rows}
+        self.assertIn("daily_stats_date", consumers)
+        self.assertIn("account_profile", consumers)
+        accounts = {
+            r["work_key"] for r in self.client.query(
+                "SELECT work_key FROM aggregate_repair_queue WHERE consumer='account_profile'"
+            )
+        }
+        self.assertEqual(accounts, {"UC_a", "UC_x", "UC_b", "UC_y"})
+        self.assertNotIn("UC_c", accounts, "変化していないthread_cの著者を含めてはいけない")
 
 
 class MonthlySweepResumeTests(unittest.TestCase):

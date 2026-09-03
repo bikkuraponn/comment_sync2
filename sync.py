@@ -1349,6 +1349,7 @@ def _known_reply_counts(client: TursoClient, thread_ids: list[str]) -> dict[str,
 def _recheck_threads(
     client: TursoClient, youtube, threads: list[dict], label: str,
     pass2_cap: int | None = None,
+    touched_ids: list[str] | None = None,
 ) -> tuple[int, int, int, bool, int]:
     """スレッド群に Pass1/Pass2 を適用する。巡回チェックと月次スイープの共通処理。
 
@@ -1357,6 +1358,14 @@ def _recheck_threads(
     1回の呼び出しの実行時間を有界にするための安全弁(HOT_BATCH_CAP/PASS2_RUN_CAP
     の注記参照)。上限を超えた食い違いは今回書き込まれないだけで、次回の
     Pass1 でも同じ食い違いとして再検知される(恒久的な見逃しにはならない)。
+
+    touched_ids: 渡された場合、消滅/食い違いと判定されたスレッドID(=このチャンクで
+    comments行が変化した可能性がある集合)をこのリストに追記する(2026-09-04追加。
+    monthly_sweep.py が repair_queue 登録対象をチャンク全件ではなくこの絞り込んだ
+    集合だけに限定するために使う — 値は本関数がPass1後にどのみち計算している
+    ものをそのまま渡すだけなので、追加のTurso読み取りは発生しない)。Pass2の
+    書き込みで例外が飛んでも、追記自体はそれより前(Pass1完了直後)に済んでいる
+    ため、呼び出し側は例外時でも「どこまで変化があったか」を正しく把握できる。
 
     戻り値: (書き込んだ返信件数, 消滅スレッド数, 食い違いスレッド数, 中断したか, Pass2で先送りした件数)
     「中断したか」が True のときは Pass1 が完走していないので、
@@ -1407,6 +1416,10 @@ def _recheck_threads(
         tid for tid in alive_ids
         if reply_counts.get(tid, 0) != known_counts.get(tid, 0)
     ]
+
+    if touched_ids is not None:
+        touched_ids.extend(dead_ids)
+        touched_ids.extend(mismatched)
 
     # 2026-08-06: totalReplyCount <= INLINE_REPLIES_LIMIT のスレッドは、
     # Pass1で既に取得済みの inline_replies だけで完結できる(追加のAPI呼び出し
