@@ -129,7 +129,6 @@ def _repair_work(rows: list[dict]) -> dict[str, set[str]]:
     if rows:
         work["network_full"].add("required")
         work["calendar_wordcloud_full"].add("required")
-        work["account_map"].add("required")
     return work
 
 

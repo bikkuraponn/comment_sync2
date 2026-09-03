@@ -49,7 +49,6 @@ class MonthlySweepRepairTests(unittest.TestCase):
         self.assertEqual(work["account_profile"], {"UC123"})
         self.assertEqual(work["network_full"], {"required"})
         self.assertEqual(work["calendar_wordcloud_full"], {"required"})
-        self.assertEqual(work["account_map"], {"required"})
 
 
 class SqlShapeTest(unittest.TestCase):
