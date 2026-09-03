@@ -259,6 +259,41 @@ def complete_state(client: TursoClient, state: dict) -> None:
     )
 
 
+def reconcile_resume_state(client: TursoClient, state: dict, threads: list[dict]) -> None:
+    """Resume時、固定窓の実測件数を保存済みの残り件数と突き合わせる。
+
+    2026-09-04: 過去期間に該当する新規スレッドが後から検知されるのは正常な挙動
+    (YouTube側の審査保留等で表示が数分〜数日遅れることがある)。以前はここで
+    件数の完全一致を要求してRuntimeErrorにしていたが、毎分動く本体同期がこの
+    種の後発スレッドを継続的に見つけるため、実運用ではresumeがほぼ確実に失敗
+    していた(2026-09-01のクラッシュ後、2日で+4件、さらに8分後の再試行で+2件の
+    ドリフトを実際に観測)。増えた分は取りこぼさず対象に含め、total_countを
+    実測値に補正してから続行する(state を直接書き換える)。
+    減った場合だけは既存データの消失を意味するため引き続き中断する。
+    """
+    expected_remaining = int(state["total_count"]) - int(state["processed_count"])
+    actual_remaining = len(threads)
+    if actual_remaining < expected_remaining:
+        raise RuntimeError(
+            "fixed-window thread count shrank while resuming (rows should "
+            "never disappear from a past published_at range once written): "
+            f"expected at least {expected_remaining}, got {actual_remaining}"
+        )
+    if actual_remaining > expected_remaining:
+        grew_by = actual_remaining - expected_remaining
+        state["total_count"] = int(state["total_count"]) + grew_by
+        client.execute(
+            "UPDATE monthly_sweep_state SET total_count=? "
+            "WHERE state_key=? AND status='in_progress'",
+            [state["total_count"], STATE_KEY],
+        )
+        print(
+            f"  再開: 対象期間内で後から検知された新規スレッドを{grew_by}件検知。"
+            f"total_countを{state['total_count']}に補正して続行",
+            flush=True,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=DEFAULT_DAYS,
@@ -319,12 +354,7 @@ def main() -> None:
             state.get("cursor_published_at"),
             state.get("cursor_comment_id"),
         )
-        expected_remaining = int(state["total_count"]) - int(state["processed_count"])
-        if len(threads) != expected_remaining:
-            raise RuntimeError(
-                "fixed-window thread count changed while resuming: "
-                f"expected {expected_remaining}, got {len(threads)}"
-            )
+        reconcile_resume_state(client, state, threads)
         print(
             f"  再開: {state['processed_count']}/{state['total_count']}件完了済み / "
             f"固定窓 {state['window_start']}..{state['window_end']}",

@@ -132,6 +132,41 @@ class MonthlySweepResumeTests(unittest.TestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(completed["processed_count"], 5)
 
+    def test_reconcile_resume_state_absorbs_late_arriving_threads(self):
+        # initialize_state 経由で実物の monthly_sweep_state 行を作る
+        # (total_count=5, processed_count=2 -> 残り3件のはずが、後から
+        # 検知された過去投稿の分だけ4件返ってきたケースを模擬)。
+        state, _ = monthly_sweep.initialize_state(
+            self.client, days=1, window_end=500, resume_offset=2,
+        )
+        threads = [{"comment_id": f"extra{i}"} for i in range(4)]
+
+        monthly_sweep.reconcile_resume_state(self.client, state, threads)
+
+        self.assertEqual(state["total_count"], 6)
+        persisted = monthly_sweep.load_state(self.client)
+        self.assertEqual(persisted["total_count"], 6)
+
+    def test_reconcile_resume_state_raises_when_threads_disappear(self):
+        state, _ = monthly_sweep.initialize_state(
+            self.client, days=1, window_end=500, resume_offset=2,
+        )
+        threads = [{"comment_id": "t3"}]  # 1 < 5-2=3 のはず
+
+        with self.assertRaises(RuntimeError):
+            monthly_sweep.reconcile_resume_state(self.client, state, threads)
+
+    def test_reconcile_resume_state_is_noop_when_count_matches(self):
+        state, remaining = monthly_sweep.initialize_state(
+            self.client, days=1, window_end=500, resume_offset=2,
+        )
+
+        monthly_sweep.reconcile_resume_state(self.client, state, remaining)
+
+        self.assertEqual(state["total_count"], 5)
+        # UPDATEを発行していないので行自体は変化していない
+        self.assertEqual(monthly_sweep.load_state(self.client)["total_count"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()
