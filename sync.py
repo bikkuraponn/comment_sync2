@@ -24,6 +24,7 @@ run_reply_recheck_batch()/run_hot_recheck_batch() だけ(sync_new_comments は
   CRONJOB_SECRET   (GitHub Actions の secret 認証用)
 """
 
+import http.client
 import json
 import os
 import sys
@@ -232,6 +233,44 @@ def _handle_api_error(e: HttpError, youtube, rate_limit_retries: int):
     if not rotate_key(e, daily_quota=is_daily_quota_error(e)):
         return youtube, rate_limit_retries, False, True
     return get_youtube(), 0, False, False
+
+
+# 2026-09-03追加: HTTPレスポンスが返ってくる前の低レベルな接続断
+# (ssl.SSLEOFError等)。comment_sync2のmonthly_sweep Run #13が、20分・2,400
+# リクエスト超の連続実行の途中でこれに遭遇し、_handle_api_error(HttpErrorしか
+# 見ない)ではキャッチされずmain()まで伝播してクラッシュした。原因はキー固有の
+# 問題やクォータではなく、get_youtube()が内部で使うhttplib2の持続接続を長時間
+# 使い回すうちにどこかのタイミングで相手側に切断されたと考えられるため、
+# バックオフ待機に加えて次の試行では新しいyoutubeクライアント(=新しい接続)を
+# 使う。ssl.SSLError/ConnectionError/TimeoutErrorはいずれもOSErrorのサブクラス
+# なのでOSErrorでまとめて捕捉し、OSErrorのサブクラスではないhttp.client固有の
+# 例外(BadStatusLine/IncompleteRead等)も別途含める。
+MAX_TRANSPORT_RETRIES = 3
+TRANSPORT_BACKOFF_BASE_SEC = 2  # 2, 4, 8 秒
+
+TRANSIENT_TRANSPORT_ERRORS = (OSError, http.client.HTTPException)
+
+
+def _handle_transport_error(e: Exception, youtube, transport_retries: int):
+    """低レベル接続エラー用の共通ハンドリング(_handle_api_error と同じ形)。
+
+    戻り値: (次に使う youtube クライアント, 更新後の transport_retries,
+             呼び出し元で raise すべきか)
+    """
+    if transport_retries < MAX_TRANSPORT_RETRIES:
+        wait = TRANSPORT_BACKOFF_BASE_SEC * (2 ** transport_retries)
+        print(
+            f"  低レベル接続エラー({type(e).__name__}: {e})、{wait}秒待って新しい接続で"
+            f"リトライ({transport_retries + 1}/{MAX_TRANSPORT_RETRIES})",
+            flush=True,
+        )
+        time.sleep(wait)
+        return get_youtube(), transport_retries + 1, False
+    print(
+        f"  低レベル接続エラーが{MAX_TRANSPORT_RETRIES}回連続で解消しないため諦める: {e}",
+        flush=True,
+    )
+    return youtube, transport_retries, True
 
 
 # ------------------------------------------------------------------ #
@@ -568,6 +607,7 @@ def fetch_all_replies(
     seen_ids = {r["id"] for r in included_replies}
     next_page = None
     rate_limit_retries = 0
+    transport_retries = 0
 
     while True:
         try:
@@ -586,6 +626,13 @@ def fetch_all_replies(
                 raise
             if exhausted:
                 break
+            continue
+        except TRANSIENT_TRANSPORT_ERRORS as e:
+            youtube, transport_retries, should_raise = _handle_transport_error(
+                e, youtube, transport_retries,
+            )
+            if should_raise:
+                raise
             continue
 
         for r in resp.get("items", []):
@@ -663,6 +710,7 @@ def sync_new_comments(client: TursoClient) -> int:
     found_in_window = False  # 固定コメント(2024年投稿)が先頭に来る対策
     pages = 0
     rate_limit_retries = 0
+    transport_retries = 0
     pinned_reconciles = 0
     # 8対象時刻パターンにマッチした新着スレッドだけ、真の投稿順(このrun内でのAPI応答順、
     # order="time"=新しい順)を thread_order_evidence へ記録する(2026-08-12追加)。
@@ -687,6 +735,13 @@ def sync_new_comments(client: TursoClient) -> int:
                 raise
             if exhausted:
                 break
+            continue
+        except TRANSIENT_TRANSPORT_ERRORS as e:
+            youtube, transport_retries, should_raise = _handle_transport_error(
+                e, youtube, transport_retries,
+            )
+            if should_raise:
+                raise
             continue
 
         pages += 1
@@ -857,6 +912,7 @@ def _resync_thread_replies(
     items: list[dict] = []
     fetched_ids: set[str] = set()
     rate_limit_retries = 0
+    transport_retries = 0
     exhausted_mid_page = False
 
     while True:
@@ -877,6 +933,13 @@ def _resync_thread_replies(
             if exhausted:
                 exhausted_mid_page = True
                 break
+            continue
+        except TRANSIENT_TRANSPORT_ERRORS as e:
+            youtube, transport_retries, should_raise = _handle_transport_error(
+                e, youtube, transport_retries,
+            )
+            if should_raise:
+                raise
             continue
 
         for r in resp.get("items", []):
@@ -1220,6 +1283,7 @@ def _pass1_reply_counts(youtube, thread_ids: list[str]):
     reply_counts: dict[str, int] = {}
     inline_replies_map: dict[str, list] = {}
     rate_limit_retries = 0
+    transport_retries = 0
 
     for i in range(0, len(thread_ids), RECHECK_ID_CHUNK):
         chunk = thread_ids[i:i + RECHECK_ID_CHUNK]
@@ -1240,6 +1304,13 @@ def _pass1_reply_counts(youtube, thread_ids: list[str]):
                     raise
                 if exhausted:
                     return youtube, alive_ids, reply_counts, inline_replies_map, True, False
+                continue
+            except TRANSIENT_TRANSPORT_ERRORS as e:
+                youtube, transport_retries, should_raise = _handle_transport_error(
+                    e, youtube, transport_retries,
+                )
+                if should_raise:
+                    raise
                 continue
 
         if resp.get("nextPageToken"):
@@ -1885,7 +1956,11 @@ def _ksk_pass1(youtube, thread_ids: list[str]) -> tuple[set, dict, bool]:
             resp = youtube.commentThreads().list(
                 part="snippet", id=",".join(chunk), textFormat="plainText", maxResults=50,
             ).execute()
-        except HttpError as e:
+        except (HttpError, OSError, http.client.HTTPException) as e:
+            # OSError/http.client.HTTPExceptionはssl.SSLEOFError等の低レベル接続断
+            # (2026-09-03追加、TRANSIENT_TRANSPORT_ERRORS参照)。ここは元々リトライを
+            # 持たない設計(状態を持たないので次の分の実行が自然なリトライになる)なので、
+            # HttpErrorと同じくログを出して諦めるだけでよい。
             print(f"  ksk Pass1 失敗: {e}", flush=True)
             return alive, counts, False
         if resp.get("nextPageToken"):
