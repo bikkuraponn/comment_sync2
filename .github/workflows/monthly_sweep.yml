@@ -35,7 +35,11 @@ concurrency:
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # monthly_sweep.py の TIME_BUDGET_SEC(300分)より長く取り、時間予算超過後に
+    # 進行中のチャンクを完了してから正常終了する猶予(実測: 1チャンク5000件で
+    # 8〜10分)+ セットアップのオーバーヘッドを吸収する。GitHub Actionsの単一
+    # ジョブ上限(360分)には収まる範囲。
+    timeout-minutes: 330
     steps:
       - name: Check JST monthly schedule
         id: jst_gate
