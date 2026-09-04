@@ -91,7 +91,14 @@ jobs:
           SWEEP_WINDOW_END:          ${{ github.event.inputs.window_end || '' }}
           SWEEP_RESUME_FROM_PUBLISHED_AT: ${{ github.event.inputs.resume_from_published_at || '' }}
           SWEEP_RESUME_FROM_COMMENT_ID:   ${{ github.event.inputs.resume_from_comment_id || '' }}
-          SWEEP_RESTART:             ${{ github.event.inputs.restart || 'false' }}
+          # jst_gateがrun=trueにするのはworkflow_dispatch(手動)か、repository_dispatchの
+          # JST1日のみ。つまりrepository_dispatchでここに来た時点で「今日は月初」が
+          # 確定しているので、無条件で--restartを強制する。これが無いと、前月分が
+          # in_progressのまま残っている場合(タイムアウト・クラッシュ等)に自動実行が
+          # 新しい月の窓へ進まず、前月の古い窓をいつまでも再開し続けてしまう
+          # (analytics_aggregates_monthly.ymlのFORCE_NETWORK_FULLと同じ考え方)。
+          # 手動実行(workflow_dispatch)はこれまで通りrestart入力に従う(既定false=resume)。
+          SWEEP_RESTART:             ${{ github.event_name == 'repository_dispatch' || github.event.inputs.restart || 'false' }}
           SWEEP_DRY_RUN:             ${{ github.event.inputs.dry_run || 'false' }}
         run: |
           ARGS="--days $SWEEP_DAYS"
