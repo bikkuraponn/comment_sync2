@@ -140,9 +140,13 @@ class PersistChunkRepairsTests(unittest.TestCase):
         self.assertNotIn("UC_c", accounts, "変化していないthread_cの著者を含めてはいけない")
 
 
-class MonthlySweepResumeTests(unittest.TestCase):
+class FetchThreadsLimitTests(unittest.TestCase):
+    """2026-09-04: fetch_threads()にLIMITを追加した際の回帰テスト。
+    cursorとlimitを組み合わせて使うのがメインループの通常経路になる。"""
+
     def setUp(self):
         self.client = SqliteTurso()
+        self.addCleanup(self.client.db.close)
         self.client.execute(
             "CREATE TABLE comments (comment_id TEXT PRIMARY KEY, parent_id TEXT, published_at INTEGER)"
         )
@@ -160,69 +164,106 @@ class MonthlySweepResumeTests(unittest.TestCase):
                 [comment_id, parent_id, published_at],
             )
 
-    def test_initial_offset_and_checkpoints_use_stable_composite_cursor(self):
-        state, remaining = monthly_sweep.initialize_state(
-            self.client, days=1, window_end=500, resume_offset=2,
-        )
-        self.assertEqual(state["processed_count"], 2)
-        self.assertEqual(state["total_count"], 5)
-        self.assertEqual(state["cursor_comment_id"], "t2")
-        self.assertEqual([row["comment_id"] for row in remaining], ["t3", "t4", "t5"])
+    def test_limit_bounds_the_read_in_published_at_then_id_order(self):
+        rows = monthly_sweep.fetch_threads(self.client, 0, 500, limit=2)
+        # published_at=100が2件(t1,t2)あるので同着はcomment_id昇順でタイブレーク
+        self.assertEqual([r["comment_id"] for r in rows], ["t1", "t2"])
 
-        monthly_sweep.checkpoint_state(self.client, state, remaining[:2])
+    def test_limit_and_cursor_together_return_the_next_chunk(self):
+        rows = monthly_sweep.fetch_threads(
+            self.client, 0, 500, cursor_published_at=100, cursor_comment_id="t1", limit=2,
+        )
+        self.assertEqual([r["comment_id"] for r in rows], ["t2", "t3"])
+
+    def test_no_limit_returns_everything_remaining(self):
+        rows = monthly_sweep.fetch_threads(self.client, 0, 500)
+        self.assertEqual([r["comment_id"] for r in rows], ["t1", "t2", "t3", "t4", "t5"])
+
+    def test_short_chunk_signals_window_exhausted(self):
+        # 窓の終端付近でLIMIT件に満たない=呼び出し側が完了判定に使う性質
+        rows = monthly_sweep.fetch_threads(
+            self.client, 0, 500, cursor_published_at=300, cursor_comment_id="t4", limit=5,
+        )
+        self.assertEqual([r["comment_id"] for r in rows], ["t5"])
+        self.assertLess(len(rows), 5)
+
+
+class MonthlySweepStateTests(unittest.TestCase):
+    """2026-09-04: 状態管理をcursorのみで前に進む方式に作り替えた際の回帰テスト。
+    総件数を事前に数える必要が無いため、start_fresh_state()はcommentsを一切
+    読まないことが最重要の性質(--restartのたびに全件読んでいた旧問題の解決確認)。"""
+
+    def setUp(self):
+        self.client = SqliteTurso()
+        self.addCleanup(self.client.db.close)
+        self.client.execute(
+            "CREATE TABLE comments (comment_id TEXT PRIMARY KEY, parent_id TEXT, published_at INTEGER)"
+        )
+
+    def _exploding_client(self):
+        class _ExplodingTurso(SqliteTurso):
+            def query(self, sql, args=None, timeout=30):
+                if "FROM comments" in sql:
+                    raise AssertionError("comments テーブルを読んではいけない")
+                return super().query(sql, args, timeout)
+        client = _ExplodingTurso()
+        self.addCleanup(client.db.close)
+        return client
+
+    def test_start_fresh_state_never_reads_comments(self):
+        client = self._exploding_client()
+        state = monthly_sweep.start_fresh_state(
+            client, days=1, window_end=500,
+            resume_from_published_at=None, resume_from_comment_id=None,
+        )
+        self.assertEqual(state["processed_count"], 0)
+        self.assertIsNone(state["cursor_published_at"])
+        self.assertIsNone(state["cursor_comment_id"])
+        self.assertEqual(state["window_start"], 500 - 1 * 86400)
+        loaded = monthly_sweep.load_state(client)
+        self.assertEqual(loaded["status"], "in_progress")
+        self.assertEqual(loaded["processed_count"], 0)
+
+    def test_start_fresh_state_with_manual_resume_from_cursor_skips_a_read(self):
+        client = self._exploding_client()
+        state = monthly_sweep.start_fresh_state(
+            client, days=1, window_end=500,
+            resume_from_published_at=200, resume_from_comment_id="t3",
+        )
+        self.assertEqual(state["cursor_published_at"], 200)
+        self.assertEqual(state["cursor_comment_id"], "t3")
+
+    def test_checkpoint_then_complete_round_trip(self):
+        state = monthly_sweep.start_fresh_state(
+            self.client, days=1, window_end=500,
+            resume_from_published_at=None, resume_from_comment_id=None,
+        )
+        for comment_id, parent_id, published_at in (
+            ("t1", None, 100), ("t2", None, 100), ("t3", None, 200),
+        ):
+            self.client.execute(
+                "INSERT INTO comments(comment_id,parent_id,published_at) VALUES(?,?,?)",
+                [comment_id, parent_id, published_at],
+            )
+
+        chunk = monthly_sweep.fetch_threads(
+            self.client, state["window_start"], state["window_end"],
+            state["cursor_published_at"], state["cursor_comment_id"], limit=2,
+        )
+        state["cursor_published_at"] = int(chunk[-1]["published_at"])
+        state["cursor_comment_id"] = str(chunk[-1]["comment_id"])
+        state["processed_count"] += len(chunk)
+        monthly_sweep.checkpoint_state(self.client, state)
+
         loaded = monthly_sweep.load_state(self.client)
-        self.assertEqual(loaded["processed_count"], 4)
-        self.assertEqual(loaded["cursor_comment_id"], "t4")
+        self.assertEqual(loaded["status"], "in_progress")
+        self.assertEqual(loaded["processed_count"], 2)
+        self.assertEqual(loaded["cursor_comment_id"], "t2")
 
-        resumed = monthly_sweep.fetch_threads(
-            self.client,
-            loaded["window_start"],
-            loaded["window_end"],
-            loaded["cursor_published_at"],
-            loaded["cursor_comment_id"],
-        )
-        self.assertEqual([row["comment_id"] for row in resumed], ["t5"])
-
-        monthly_sweep.checkpoint_state(self.client, state, resumed)
         monthly_sweep.complete_state(self.client, state)
         completed = monthly_sweep.load_state(self.client)
         self.assertEqual(completed["status"], "completed")
-        self.assertEqual(completed["processed_count"], 5)
-
-    def test_reconcile_resume_state_absorbs_late_arriving_threads(self):
-        # initialize_state 経由で実物の monthly_sweep_state 行を作る
-        # (total_count=5, processed_count=2 -> 残り3件のはずが、後から
-        # 検知された過去投稿の分だけ4件返ってきたケースを模擬)。
-        state, _ = monthly_sweep.initialize_state(
-            self.client, days=1, window_end=500, resume_offset=2,
-        )
-        threads = [{"comment_id": f"extra{i}"} for i in range(4)]
-
-        monthly_sweep.reconcile_resume_state(self.client, state, threads)
-
-        self.assertEqual(state["total_count"], 6)
-        persisted = monthly_sweep.load_state(self.client)
-        self.assertEqual(persisted["total_count"], 6)
-
-    def test_reconcile_resume_state_raises_when_threads_disappear(self):
-        state, _ = monthly_sweep.initialize_state(
-            self.client, days=1, window_end=500, resume_offset=2,
-        )
-        threads = [{"comment_id": "t3"}]  # 1 < 5-2=3 のはず
-
-        with self.assertRaises(RuntimeError):
-            monthly_sweep.reconcile_resume_state(self.client, state, threads)
-
-    def test_reconcile_resume_state_is_noop_when_count_matches(self):
-        state, remaining = monthly_sweep.initialize_state(
-            self.client, days=1, window_end=500, resume_offset=2,
-        )
-
-        monthly_sweep.reconcile_resume_state(self.client, state, remaining)
-
-        self.assertEqual(state["total_count"], 5)
-        # UPDATEを発行していないので行自体は変化していない
-        self.assertEqual(monthly_sweep.load_state(self.client)["total_count"], 5)
+        self.assertEqual(completed["processed_count"], 2)
 
 
 if __name__ == "__main__":

@@ -13,10 +13,14 @@ on:
         description: "固定スキャン窓の終了epoch秒（初回再開用）"
         required: false
         default: ""
-      resume_offset:
-        description: "初回状態作成時の処理済み件数"
+      resume_from_published_at:
+        description: "手動復旧用: このpublished_atより後ろから開始(resume_from_comment_idと併用必須、restart時のみ有効)"
         required: false
-        default: "0"
+        default: ""
+      resume_from_comment_id:
+        description: "手動復旧用: resume_from_published_atと同じ行のcomment_id"
+        required: false
+        default: ""
       restart:
         description: "既存カーソルを破棄して新規開始"
         type: boolean
@@ -85,7 +89,8 @@ jobs:
           TURSO_AUTH_TOKEN:          ${{ secrets.TURSO_AUTH_TOKEN }}
           SWEEP_DAYS:                ${{ github.event.inputs.days || '31' }}
           SWEEP_WINDOW_END:          ${{ github.event.inputs.window_end || '' }}
-          SWEEP_RESUME_OFFSET:       ${{ github.event.inputs.resume_offset || '0' }}
+          SWEEP_RESUME_FROM_PUBLISHED_AT: ${{ github.event.inputs.resume_from_published_at || '' }}
+          SWEEP_RESUME_FROM_COMMENT_ID:   ${{ github.event.inputs.resume_from_comment_id || '' }}
           SWEEP_RESTART:             ${{ github.event.inputs.restart || 'false' }}
           SWEEP_DRY_RUN:             ${{ github.event.inputs.dry_run || 'false' }}
         run: |
@@ -93,8 +98,8 @@ jobs:
           if [[ -n "$SWEEP_WINDOW_END" ]]; then
             ARGS="$ARGS --window-end $SWEEP_WINDOW_END"
           fi
-          if [[ "$SWEEP_RESUME_OFFSET" != "0" ]]; then
-            ARGS="$ARGS --resume-offset $SWEEP_RESUME_OFFSET"
+          if [[ -n "$SWEEP_RESUME_FROM_PUBLISHED_AT" ]]; then
+            ARGS="$ARGS --resume-from-published-at $SWEEP_RESUME_FROM_PUBLISHED_AT --resume-from-comment-id $SWEEP_RESUME_FROM_COMMENT_ID"
           fi
           if [[ "$SWEEP_RESTART" == "true" ]]; then
             ARGS="$ARGS --restart"
