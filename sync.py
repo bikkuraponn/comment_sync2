@@ -1580,7 +1580,7 @@ def compute_hour_bucket(client: TursoClient, hour_start: int) -> dict:
     hour_end = hour_start + 3600
     rows = client.query(
         "SELECT parent_id, handle FROM comments "
-        "WHERE is_deleted = 0 AND published_at >= ? AND published_at < ?",
+        "WHERE published_at >= ? AND published_at < ?",
         [hour_start, hour_end],
     )
     thread_count = sum(1 for r in rows if r["parent_id"] is None)
